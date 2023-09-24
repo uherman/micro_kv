@@ -5,44 +5,79 @@ extern crate serde_json;
 
 use async_std::task;
 use rocket::config::LogLevel;
+use rocket::response::status;
 use rocket::serde::json::Json;
-use rocket::{Config, State};
-use serde_json::{json, Value};
-use slog::{o, Drain, Logger};
+use rocket::{ Config, State };
+use serde_json::{ json, Value };
+use serde::Serialize;
+use slog::{ o, Drain, Logger };
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{ Arc, Mutex };
+use std::time::{ Duration, Instant };
+
+#[derive(Serialize)]
+struct EntryWithMetadata {
+    value: Value,
+    ttl: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct TtlResponse {
+    ttl: Option<f64>,
+    status: &'static str,
+}
 
 // Define type aliases for readability.
-type ExpiryTime = Instant;
+type ExpiryTime = Option<Instant>;
 type Db = Arc<Mutex<HashMap<String, (String, ExpiryTime)>>>;
 
 /// Periodically cleans up expired keys in the database.
 async fn cleanup_expired_keys(db: Db) {
     loop {
-        task::sleep(Duration::from_secs(1)).await; // Runs every second
+        let sleep_duration = {
+            let db = db.lock().unwrap();
+            db.iter()
+                .filter_map(|(_, (_, expiry))| *expiry)
+                .min()
+                .map(|next_expiry| {
+                    let now = Instant::now();
+                    if next_expiry > now {
+                        next_expiry.duration_since(now)
+                    } else {
+                        Duration::from_secs(0)
+                    }
+                })
+                .unwrap_or(Duration::from_secs(1))
+        };
+
+        task::sleep(sleep_duration).await;
+
+        let now = Instant::now();
         let mut db = db.lock().unwrap();
-        db.retain(|_, (_, expiry)| *expiry > Instant::now());
+        db.retain(|_, (_, expiry)| expiry.map_or(true, |e| e > now));
     }
 }
 
 /// Retrieves all active (non-expired) entries from the database.
 #[get("/")]
-fn get_all(db: &State<Db>) -> Json<HashMap<String, Value>> {
+fn get_all(db: &State<Db>) -> Json<HashMap<String, EntryWithMetadata>> {
     let db = db.lock().unwrap();
     let mut response = HashMap::new();
 
-    // Iterates over the database and filters out expired entries
     for (key, (serialized, expiry)) in db.iter() {
-        if *expiry > Instant::now() {
-            // Attempts to deserialize the stored JSON string.
-            match serde_json::from_str(serialized) {
-                Ok(deserialized) => {
-                    response.insert(key.clone(), deserialized);
-                }
-                Err(e) => eprintln!("Error deserializing JSON: {:?}", e),
+        match serde_json::from_str(serialized) {
+            Ok(deserialized) => {
+                let expiry_metadata = expiry.map(|expiry_time|
+                    expiry_time.saturating_duration_since(Instant::now()).as_secs_f64()
+                );
+                let entry_with_metadata = EntryWithMetadata {
+                    value: deserialized,
+                    ttl: expiry_metadata,
+                };
+                response.insert(key.clone(), entry_with_metadata);
             }
+            Err(e) => eprintln!("Error deserializing JSON: {:?}", e),
         }
     }
     Json(response)
@@ -53,7 +88,7 @@ fn get_all(db: &State<Db>) -> Json<HashMap<String, Value>> {
 fn get(key: &str, db: &State<Db>, log: &State<Logger>) -> Json<Value> {
     let db = db.lock().unwrap();
     match db.get(key) {
-        Some((serialized, expiry)) if *expiry > Instant::now() => {
+        Some((serialized, _)) =>
             match serde_json::from_str(serialized) {
                 Ok(deserialized) => Json(deserialized),
                 Err(e) => {
@@ -62,15 +97,30 @@ fn get(key: &str, db: &State<Db>, log: &State<Logger>) -> Json<Value> {
                     Json(json!({ "status": status }))
                 }
             }
-        }
-        Some(_) => {
-            let status = format!("key expired: {}", key);
-            Json(json!({ "status": status }))
-        }
         None => {
-            let status = format!("key not found: {}", key);
+            let status = format!("Key not found: {}", key);
             Json(json!({ "status": status }))
         }
+    }
+}
+
+/// Retrieves the ttl for a specific entry by key from the database.
+#[get("/ttl/<key>")]
+fn get_ttl(key: &str, db: &State<Db>) -> Result<Json<TtlResponse>, status::NotFound<String>> {
+    let db = db.lock().unwrap();
+    match db.get(key) {
+        Some((_, expiry)) => {
+            let ttl = expiry.map(|expiry_time|
+                expiry_time.saturating_duration_since(Instant::now()).as_secs_f64()
+            );
+            Ok(
+                Json(TtlResponse {
+                    ttl,
+                    status: "success",
+                })
+            )
+        }
+        None => Err(status::NotFound(format!("Key not found: {}", key))),
     }
 }
 
@@ -81,14 +131,14 @@ fn create(
     ttl: Option<u64>,
     entry: Json<Value>,
     db: &State<Db>,
-    log: &State<Logger>,
+    log: &State<Logger>
 ) -> Json<Value> {
     let mut db = db.lock().unwrap();
-    let expiry = Instant::now() + Duration::from_secs(ttl.unwrap_or(300)); // Defaults to 5 minutes
+    let expiry = ttl.map(|t| Instant::now() + Duration::from_secs(t));
     match serde_json::to_string(&*entry) {
         Ok(serialized) => {
             db.insert(key.to_string(), (serialized, expiry));
-            let status = format!("key inserted: {}", key);
+            let status = format!("Key inserted: {}", key);
 
             slog::info!(log, "{}", status);
             Json(json!({ "status": status }))
@@ -105,12 +155,12 @@ fn create(
 fn delete(key: &str, db: &State<Db>, log: &State<Logger>) -> Json<Value> {
     let mut db = db.lock().unwrap();
     if db.remove(key).is_some() {
-        let status = format!("key deleted: {}", key);
+        let status = format!("Key deleted: {}", key);
 
         slog::info!(log, "{}", status);
         Json(json!({ "status": status }))
     } else {
-        Json(json!({"status": "Item Not Found"}))
+        Json(json!({"status": "Key Not Found"}))
     }
 }
 
@@ -121,11 +171,12 @@ fn rocket() -> _ {
     let db_clone = Arc::clone(&db);
     task::spawn(cleanup_expired_keys(db_clone));
 
-    rocket::build()
+    rocket
+        ::build()
         .configure(build_config())
         .manage(db)
         .manage(build_logger())
-        .mount("/", routes![get, get_all, create, delete])
+        .mount("/", routes![get, get_all, get_ttl, create, delete])
 }
 
 fn build_config() -> Config {
