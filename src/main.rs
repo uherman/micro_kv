@@ -4,10 +4,9 @@ extern crate serde;
 extern crate serde_json;
 
 use async_std::task;
-use rocket::config::LogLevel;
 use rocket::response::status;
 use rocket::serde::json::Json;
-use rocket::{ Config, State };
+use rocket::State;
 use serde_json::{ json, Value };
 use serde::Serialize;
 use slog::{ o, Drain, Logger };
@@ -173,17 +172,9 @@ fn rocket() -> _ {
 
     rocket
         ::build()
-        .configure(build_config())
         .manage(db)
         .manage(build_logger())
         .mount("/", routes![get, get_all, get_ttl, create, delete])
-}
-
-fn build_config() -> Config {
-    let mut config = Config::release_default();
-    config.log_level = LogLevel::Off;
-
-    config
 }
 
 fn build_logger() -> Logger {
